@@ -1,0 +1,9 @@
+exam_server
+create_user
+*.o
+*.db
+*.db-shm
+*.db-wal
+cookies.txt
+logs/*
+!logs/.gitkeep
