@@ -7,3 +7,4 @@ create_user
 cookies.txt
 logs/*
 !logs/.gitkeep
+*.dSYM
