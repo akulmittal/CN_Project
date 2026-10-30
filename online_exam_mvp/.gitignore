@@ -5,6 +5,7 @@ create_user
 *.db-shm
 *.db-wal
 cookies.txt
+*cookies*.txt
 logs/*
 !logs/.gitkeep
 *.dSYM
