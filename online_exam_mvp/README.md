@@ -2,7 +2,7 @@
 
 A local learning/demo implementation for the Computer Networks project. It demonstrates a C TCP/HTTP backend, Nginx reverse proxy, SQLite persistence, password hashing with libsodium/Argon2id, opaque server-side sessions, role-based routes, exam scheduling, question creation, student attempts, answer autosave, and basic auto-grading.
 
-> **Important security boundary:** this is a coursework MVP, not a production examination service. The demo currently stores grading keys in the same SQLite database as the web API. For a real deployment, move grading keys and grading into a separate service/database inaccessible to the student-facing backend. Do not expose this service to the public internet without HTTPS, request timeouts, rate limiting, CSRF protections, robust HTTP parsing, audit logging, backups, and security review. The current server handles connections sequentially; concurrency and SDN/Mininet/Ryu integration are future implementation milestones, not implemented features.
+> **Important security boundary:** this is a coursework MVP, not a production examination service. The demo currently stores grading keys in the same SQLite database as the web API. For a real deployment, move grading keys and grading into a separate service/database inaccessible to the student-facing backend. Do not expose this service to the public internet without HTTPS, request timeouts, rate limiting, CSRF protections, robust HTTP parsing, audit logging, backups, and security review. The backend uses one detached worker thread per connection, each with its own SQLite connection, and shuts down cleanly on SIGINT/SIGTERM. SDN/Mininet/Ryu integration is a future implementation milestone, not an implemented feature.
 
 ## Requirements (Ubuntu/WSL)
 
@@ -42,14 +42,20 @@ sudo cp web/index.html /var/www/html/index.html
 
 ## Start backend
 
-Terminal 1:
-
 ```bash
-cd ~/CN_Project   # or the directory where you extracted this project
-./exam_server
+./exam_server [--port PORT] [--db PATH] [--addr ADDRESS]
 ```
 
-Terminal 2 uses Nginx:
+Defaults are port `8080`, database `database/exam.db`, and bind address `0.0.0.0` (all IPv4 interfaces). Run from the project root unless you pass an absolute `--db` path. For example, two independent instances can run without rebuilding:
+
+```bash
+./exam_server --port 8080 --db database/exam.db
+./exam_server --port 8081 --db database/exam-2.db
+```
+
+The server handles each connection in its own detached worker thread and waits for active workers on Ctrl-C/SIGTERM before exiting, so it can be restarted immediately.
+
+With the server running, test through Nginx:
 
 ```bash
 curl -i http://localhost/backend/health
@@ -152,7 +158,7 @@ curl -i -b cookies.txt http://localhost/backend/api/v1/admin/results
 
 1. Move grading keys into a separate grading service/database and use authenticated service-to-service requests.
 2. Harden HTTP parser: socket timeouts, strict headers, content-type validation, body limits, correct status/error handling.
-3. Use a per-worker SQLite connection (or a database pool) and add thread/epoll-based concurrent clients. Add stress tests and measure p50/p95 latency.
+3. Add stress/load tests and measure p50/p95 latency; consider a database pool or connection reuse for high connection churn.
 4. Add CSRF tokens for cookie-authenticated state-changing routes; deploy only behind HTTPS and mark cookies `Secure`.
 5. Implement WebSocket exam updates/autosave acknowledgement and a browser question-taking UI.
 6. Add server-side clock synchronization (chrony/NTP), audit logs, backup/restore tests, and failure recovery.
