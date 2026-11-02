@@ -1,0 +1,10 @@
+# Python / SDN runtime artifacts
+__pycache__/
+*.pyc
+sdn/.venv/
+run/
+*.ndjson
+
+# Temporary test output
+*.log
+*.pid
