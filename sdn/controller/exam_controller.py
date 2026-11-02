@@ -307,10 +307,10 @@ class JsonlLog:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = open(path, "a", encoding="utf-8")
 
-    def write(self, name: str, **fields: Any) -> None:
+    def write(self, event_name: str, **fields: Any) -> None:
         record: dict[str, Any] = {
             "ts": round(time.time(), 3),
-            "event": name,
+            "event": event_name,
         }
         record.update(fields)
         line = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
@@ -897,9 +897,9 @@ class ExamController(app_manager.OSKenApp):
     # Decision logging / REST dispatch
     # ------------------------------------------------------------------
 
-    def decision(self, name: str, **fields: Any) -> None:
+    def decision(self, event_name: str, **fields: Any) -> None:
         try:
-            self.decision_log.write(name, **fields)
+            self.decision_log.write(event_name, **fields)
         except Exception:  # noqa: BLE001 - logging must not kill forwarding
             self.logger.exception("could not write decision log")
 
