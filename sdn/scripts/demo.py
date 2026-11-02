@@ -453,6 +453,16 @@ class Demo:
                 0.25,
                 "SDN QoS active",
             )
+            # QoS becomes active before the asynchronous meter/queue setup
+            # finishes.  Wait for a concrete backend so the benchmark really
+            # measures the classified flows.
+            wait_until(
+                lambda: self.state().get("qos", {}).get("backend")
+                in ("meter", "queue", "priority"),
+                10.0,
+                0.25,
+                "SDN QoS backend ready",
+            )
         iperf = shutil.which("iperf3")
         if not iperf:
             raise RuntimeError("iperf3 is not installed")
@@ -478,7 +488,7 @@ class Demo:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(2.0)
+        time.sleep(3.0)
         try:
             result = self.run_latency_probe(mode)
         finally:
