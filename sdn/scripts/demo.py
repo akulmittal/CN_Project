@@ -122,7 +122,7 @@ def wait_until(
             value = predicate()
             if value:
                 return value
-        except BaseException as exc:  # noqa: BLE001 - report the last error
+        except Exception as exc:  # noqa: BLE001 - report the last error
             last_error = exc
         time.sleep(interval)
     if last_error is not None:
@@ -714,9 +714,11 @@ class Demo:
         self.start_stubs()
         self.start_iperf_server()
 
+        self.set_mode("static")
         self.run_pingall("static")
         static_result = self.measure_mode("static")
 
+        self.set_mode("sdn")
         self.run_pingall("sdn")
         sdn_result = self.measure_mode("sdn")
 

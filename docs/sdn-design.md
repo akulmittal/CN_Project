@@ -187,8 +187,8 @@ shared by the class. With queues, the flow carries `OFPAT_SET_QUEUE`. With the
 priority-only fallback the class survives only as flow priority, and the demo
 will report a benchmark warning instead of a latency improvement.
 
-The demo uses separate workloads for static and SDN runs, so no completed exam
-attempt is submitted twice.
+The demo keeps the static and SDN benchmark phases independent, so a completed
+attempt is never reused between them.
 
 ## 5. Monitoring and abuse blocking
 
