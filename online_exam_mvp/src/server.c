@@ -4,11 +4,15 @@
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,16 +27,45 @@
 #define DEFAULT_DB "database/exam.db"
 #define DEFAULT_ADDR "0.0.0.0"
 #define REQUEST_SIZE 8192
-#define RESPONSE_SIZE 4096
 #define SESSION_COOKIE "exam_session"
 #define LOGIN_CONCURRENCY 4
 #define CLIENT_TIMEOUT_SECONDS 15
+
+#define SDN_EVENT_SIZE 1024
+#define SDN_QUEUE_CAPACITY 256
+#define SDN_HEARTBEAT_SECONDS 2
+#define SDN_TIMEOUT_MS 300
+#define SERVER_ID_SIZE 128
 
 /* Each worker owns its SQLite connection. */
 static __thread Auth auth;
 
 static const char *database_path = DEFAULT_DB;
 static volatile sig_atomic_t shutdown_requested = 0;
+
+/*
+ * Metrics are updated from request workers and read by the notifier thread.
+ * active_connections is exact (accept/finish), while active_attempts tracks
+ * attempts started or submitted through this process. It is initialized from
+ * the shared database at startup.
+ */
+static atomic_int active_attempts = 0;
+static atomic_int active_connections = 0;
+
+static char sdn_server_id[SERVER_ID_SIZE];
+static char sdn_controller_host[256];
+static int sdn_controller_port = 0;
+static struct sockaddr_in sdn_controller_address;
+static int sdn_notifier_enabled = 0;
+static int sdn_notifier_running = 0;
+static int sdn_notifier_stop_requested = 0;
+static pthread_t sdn_notifier_thread;
+static pthread_mutex_t sdn_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sdn_queue_cond = PTHREAD_COND_INITIALIZER;
+static char sdn_queue[SDN_QUEUE_CAPACITY][SDN_EVENT_SIZE];
+static unsigned int sdn_queue_head = 0;
+static unsigned int sdn_queue_tail = 0;
+static unsigned int sdn_queue_count = 0;
 
 static pthread_mutex_t workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t workers_cond = PTHREAD_COND_INITIALIZER;
@@ -67,6 +100,8 @@ typedef struct {
     int port;
     const char *db_path;
     const char *addr;
+    const char *controller_url;
+    const char *server_id;
 } ServerConfig;
 
 static void login_semaphore_wait(LoginSemaphore *sem)
@@ -98,11 +133,382 @@ static int send_all(int fd, const char *data, size_t length)
     return 0;
 }
 
+static void sdn_active_attempts_add(int delta)
+{
+    if (delta > 0) {
+        atomic_fetch_add_explicit(&active_attempts, delta, memory_order_relaxed);
+        return;
+    }
+    if (delta < 0) {
+        int current = atomic_load_explicit(&active_attempts, memory_order_relaxed);
+        while (current > 0 &&
+               !atomic_compare_exchange_weak_explicit(&active_attempts, &current,
+                                                       current - 1,
+                                                       memory_order_relaxed,
+                                                       memory_order_relaxed)) {
+        }
+    }
+}
+
+static void sdn_connection_started(void)
+{
+    atomic_fetch_add_explicit(&active_connections, 1, memory_order_relaxed);
+}
+
+static void sdn_connection_finished(void)
+{
+    int current = atomic_load_explicit(&active_connections, memory_order_relaxed);
+    while (current > 0 &&
+           !atomic_compare_exchange_weak_explicit(&active_connections, &current,
+                                                   current - 1,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) {
+    }
+}
+
+static void sdn_load_active_attempts(Auth *auth_handle)
+{
+    if (!auth_handle || !auth_handle->db) return;
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*) FROM exam_attempts WHERE status='in_progress'";
+    if (sqlite3_prepare_v2(auth_handle->db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        atomic_store_explicit(&active_attempts, sqlite3_column_int(stmt, 0),
+                              memory_order_relaxed);
+    sqlite3_finalize(stmt);
+}
+
+/*
+ * The notifier is deliberately isolated from request workers: workers only
+ * format a small JSON message and append it to a bounded queue. The dedicated
+ * thread performs all DNS-independent connect/send/recv work with 300 ms
+ * timeouts. A slow or unreachable controller can therefore never delay an API
+ * response or make an API call fail.
+ */
+static void sdn_log_failure(const char *message)
+{
+    static time_t last_logged = 0;
+    time_t now = time(NULL);
+    if (now - last_logged >= 10) {
+        fprintf(stderr, "sdn notifier: %s\n", message);
+        fflush(stderr);
+        last_logged = now;
+    }
+}
+
+static void sdn_enqueue_event(const char *body)
+{
+    if (!body) return;
+    pthread_mutex_lock(&sdn_queue_mutex);
+    if (sdn_queue_count == SDN_QUEUE_CAPACITY) {
+        /* Bounded queue: discard the oldest event rather than block a worker. */
+        sdn_queue_head = (sdn_queue_head + 1) % SDN_QUEUE_CAPACITY;
+        sdn_queue_count--;
+    }
+    snprintf(sdn_queue[sdn_queue_tail], SDN_EVENT_SIZE, "%s", body);
+    sdn_queue_tail = (sdn_queue_tail + 1) % SDN_QUEUE_CAPACITY;
+    sdn_queue_count++;
+    pthread_cond_signal(&sdn_queue_cond);
+    pthread_mutex_unlock(&sdn_queue_mutex);
+}
+
+static void sdn_emit_event(const char *event, int exam_id)
+{
+    if (!sdn_notifier_enabled) return;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+    cJSON_AddStringToObject(root, "event", event);
+    cJSON_AddStringToObject(root, "server", sdn_server_id);
+    if (exam_id > 0)
+        cJSON_AddNumberToObject(root, "exam_id", exam_id);
+    else
+        cJSON_AddNullToObject(root, "exam_id");
+    cJSON_AddNumberToObject(root, "active_attempts",
+                            atomic_load_explicit(&active_attempts, memory_order_relaxed));
+    cJSON_AddNumberToObject(root, "active_connections",
+                            atomic_load_explicit(&active_connections, memory_order_relaxed));
+    cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
+
+    char *printed = cJSON_PrintUnformatted(root);
+    if (printed) {
+        if (strlen(printed) < SDN_EVENT_SIZE) sdn_enqueue_event(printed);
+        cJSON_free(printed);
+    }
+    cJSON_Delete(root);
+}
+
+static int sdn_parse_controller_port(const char *text, int *port)
+{
+    if (!text || !*text || !port) return -1;
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || value < 1 || value > 65535) return -1;
+    *port = (int)value;
+    return 0;
+}
+
+static int sdn_parse_controller_url(const char *url)
+{
+    if (!url || strncasecmp(url, "http://", 7) != 0) return -1;
+
+    const char *authority = url + 7;
+    const char *authority_end = authority;
+    while (*authority_end && *authority_end != '/' &&
+           *authority_end != '?' && *authority_end != '#')
+        authority_end++;
+
+    size_t length = (size_t)(authority_end - authority);
+    if (length == 0 || length >= sizeof(sdn_controller_host)) return -1;
+
+    char buffer[256];
+    memcpy(buffer, authority, length);
+    buffer[length] = '\0';
+
+    char *host = buffer;
+    char *port_text = NULL;
+    char *colon = strrchr(buffer, ':');
+    if (colon) {
+        *colon = '\0';
+        port_text = colon + 1;
+    }
+    if (host[0] == '\0') return -1;
+
+    int port = 80;
+    if (port_text && sdn_parse_controller_port(port_text, &port) != 0) return -1;
+
+    snprintf(sdn_controller_host, sizeof(sdn_controller_host), "%s", host);
+    sdn_controller_port = port;
+
+    char port_string[8];
+    snprintf(port_string, sizeof(port_string), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *result = NULL;
+    if (getaddrinfo(host, port_string, &hints, &result) != 0 || !result)
+        return -1;
+    if (result->ai_addrlen != sizeof(sdn_controller_address)) {
+        freeaddrinfo(result);
+        return -1;
+    }
+    memcpy(&sdn_controller_address, result->ai_addr, sizeof(sdn_controller_address));
+    freeaddrinfo(result);
+    return 0;
+}
+
+static int sdn_http_post(const char *body)
+{
+    size_t body_length = strlen(body);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        sdn_log_failure("socket() failed");
+        return -1;
+    }
+
+    struct timeval timeout = { .tv_sec = 0, .tv_usec = SDN_TIMEOUT_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        sdn_log_failure("fcntl(F_GETFL) failed");
+        close(fd);
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        sdn_log_failure("fcntl(F_SETFL) failed");
+        close(fd);
+        return -1;
+    }
+
+    int rc = connect(fd, (struct sockaddr *)&sdn_controller_address,
+                     sizeof(sdn_controller_address));
+    if (rc < 0 && errno == EINPROGRESS) {
+        struct pollfd poll_fd = { .fd = fd, .events = POLLOUT };
+        do {
+            rc = poll(&poll_fd, 1, SDN_TIMEOUT_MS);
+        } while (rc < 0 && errno == EINTR);
+        if (rc <= 0) {
+            sdn_log_failure(rc == 0 ? "controller connect timed out"
+                                      : "controller connect poll failed");
+            close(fd);
+            return -1;
+        }
+        int socket_error = 0;
+        socklen_t error_length = sizeof(socket_error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_length) != 0 ||
+            socket_error != 0) {
+            sdn_log_failure("controller connect failed");
+            close(fd);
+            return -1;
+        }
+    } else if (rc < 0) {
+        sdn_log_failure("controller connect failed");
+        close(fd);
+        return -1;
+    }
+    (void)fcntl(fd, F_SETFL, flags);
+
+    char header[1024];
+    int header_length = snprintf(header, sizeof(header),
+        "POST /exam/event HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "User-Agent: exam-server-sdn/1\r\n"
+        "\r\n",
+        sdn_controller_host, sdn_controller_port, body_length);
+    if (header_length <= 0 || (size_t)header_length >= sizeof(header)) {
+        close(fd);
+        return -1;
+    }
+
+    if (send_all(fd, header, (size_t)header_length) != 0 ||
+        send_all(fd, body, body_length) != 0) {
+        sdn_log_failure("controller send timed out or failed");
+        close(fd);
+        return -1;
+    }
+
+    char response[256];
+    ssize_t received = recv(fd, response, sizeof(response) - 1, 0);
+    close(fd);
+    if (received <= 0) {
+        sdn_log_failure("controller response timed out or was empty");
+        return -1;
+    }
+    response[received] = '\0';
+    int status = 0;
+    if (sscanf(response, "HTTP/%*s %d", &status) != 1 ||
+        status < 200 || status >= 300) {
+        sdn_log_failure("controller rejected event");
+        return -1;
+    }
+    return 0;
+}
+
+static void *sdn_notifier_main(void *argument)
+{
+    (void)argument;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += SDN_HEARTBEAT_SECONDS;
+
+    for (;;) {
+        char event[SDN_EVENT_SIZE];
+        int have_event = 0;
+
+        pthread_mutex_lock(&sdn_queue_mutex);
+        while (sdn_queue_count == 0 && !sdn_notifier_stop_requested) {
+            int rc = pthread_cond_timedwait(&sdn_queue_cond, &sdn_queue_mutex, &deadline);
+            if (rc == ETIMEDOUT) break;
+        }
+        if (sdn_notifier_stop_requested) {
+            pthread_mutex_unlock(&sdn_queue_mutex);
+            break;
+        }
+        if (sdn_queue_count > 0) {
+            snprintf(event, sizeof(event), "%s", sdn_queue[sdn_queue_head]);
+            sdn_queue_head = (sdn_queue_head + 1) % SDN_QUEUE_CAPACITY;
+            sdn_queue_count--;
+            have_event = 1;
+        }
+        pthread_mutex_unlock(&sdn_queue_mutex);
+
+        if (have_event) (void)sdn_http_post(event);
+
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            sdn_emit_event("server_status", -1);
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += SDN_HEARTBEAT_SECONDS;
+        }
+    }
+    return NULL;
+}
+
+static void sdn_notifier_start(const char *url)
+{
+    if (!url || url[0] == '\0') return;
+    if (sdn_parse_controller_url(url) != 0) {
+        fprintf(stderr,
+                "Ignoring invalid controller URL '%s'; expected http://HOST:PORT\n",
+                url);
+        return;
+    }
+
+    /*
+     * Keep shutdown signals on the main thread. The notifier inherits this
+     * blocked mask, so SIGINT always interrupts accept() instead of landing on
+     * a thread parked in pthread_cond_timedwait().
+     */
+    sigset_t blocked, previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+
+    sdn_notifier_enabled = 1;
+    if (pthread_create(&sdn_notifier_thread, NULL, sdn_notifier_main, NULL) != 0) {
+        sdn_notifier_enabled = 0;
+        pthread_sigmask(SIG_SETMASK, &previous, NULL);
+        fprintf(stderr, "Could not start SDN notifier thread.\n");
+        return;
+    }
+    pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    sdn_notifier_running = 1;
+    /* Register this instance immediately; heartbeats follow every 2 seconds. */
+    sdn_emit_event("server_status", -1);
+    printf("SDN notifier sending events to %s:%d\n",
+           sdn_controller_host, sdn_controller_port);
+    fflush(stdout);
+}
+
+static void sdn_notifier_stop(void)
+{
+    if (!sdn_notifier_running) return;
+    pthread_mutex_lock(&sdn_queue_mutex);
+    sdn_notifier_stop_requested = 1;
+    pthread_cond_broadcast(&sdn_queue_cond);
+    pthread_mutex_unlock(&sdn_queue_mutex);
+    pthread_join(sdn_notifier_thread, NULL);
+    sdn_notifier_running = 0;
+    sdn_notifier_enabled = 0;
+}
+
 static void respond(int fd, int status, const char *reason,
                     const char *body, const char *extra_headers)
 {
-    char response[RESPONSE_SIZE];
-    int n = snprintf(response, sizeof(response),
+    const char *safe_body = body ? body : "";
+    const char *safe_headers = extra_headers ? extra_headers : "";
+    size_t body_length = strlen(safe_body);
+    size_t headers_length = strlen(safe_headers);
+
+    /*
+     * Responses are built dynamically. The old 4 KiB stack buffer silently
+     * rejected a large exam paper; a 50-question JSON response can exceed it.
+     */
+    size_t capacity = 512 + headers_length + body_length;
+    char *response = malloc(capacity);
+    if (!response) {
+        static const char fallback[] =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: 26\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"out_of_memory\"}\n";
+        send_all(fd, fallback, sizeof(fallback) - 1);
+        return;
+    }
+
+    int n = snprintf(response, capacity,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
@@ -112,8 +518,9 @@ static void respond(int fd, int status, const char *reason,
         "%s"
         "\r\n"
         "%s",
-        status, reason, strlen(body), extra_headers ? extra_headers : "", body);
-    if (n > 0 && (size_t)n < sizeof(response)) send_all(fd, response, (size_t)n);
+        status, reason, body_length, safe_headers, safe_body);
+    if (n > 0 && (size_t)n < capacity) send_all(fd, response, (size_t)n);
+    free(response);
 }
 
 static void respond_json(int fd, int status, const char *reason,
@@ -125,15 +532,20 @@ static void respond_json(int fd, int status, const char *reason,
                 "{\"error\":\"response_serialization_failed\"}\n", NULL);
         return;
     }
-    if (strlen(printed) >= RESPONSE_SIZE - 512) {
+
+    size_t printed_length = strlen(printed);
+    char *body = malloc(printed_length + 2);
+    if (!body) {
         cJSON_free(printed);
         respond(fd, 500, "Internal Server Error",
-                "{\"error\":\"response_too_large\"}\n", NULL);
+                "{\"error\":\"out_of_memory\"}\n", NULL);
         return;
     }
-    char body[RESPONSE_SIZE];
-    snprintf(body, sizeof(body), "%s\n", printed);
+    memcpy(body, printed, printed_length);
+    body[printed_length] = '\n';
+    body[printed_length + 1] = '\0';
     respond(fd, status, reason, body, extra_headers);
+    free(body);
     cJSON_free(printed);
 }
 
@@ -345,8 +757,9 @@ static cJSON *api_login(const char *username, const char *password,
     return response;
 }
 
-static cJSON *api_start_exam(int exam_id, int user_id, ApiError *error)
+static cJSON *api_start_exam(int exam_id, int user_id, ApiError *error, int *created)
 {
+    if (created) *created = 0;
     if (exam_id <= 0 || user_id <= 0 || !error) {
         if (error) *error = API_ERR_INVALID_FIELDS;
         return NULL;
@@ -365,11 +778,13 @@ static cJSON *api_start_exam(int exam_id, int user_id, ApiError *error)
     sqlite3_bind_int64(stmt, 2, (sqlite3_int64)time(NULL));
     sqlite3_bind_int(stmt, 3, exam_id);
     int rc = sqlite3_step(stmt);
+    int inserted = sqlite3_changes(auth.db);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
         *error = API_ERR_DATABASE;
         return NULL;
     }
+    if (created) *created = inserted > 0;
 
     if (sqlite3_prepare_v2(auth.db,
             "SELECT id,status FROM exam_attempts WHERE exam_id=? AND user_id=?",
@@ -523,8 +938,9 @@ static cJSON *api_save_answer(int user_id, int question_id,
     return response;
 }
 
-static cJSON *api_submit_exam(int exam_id, int user_id, ApiError *error)
+static cJSON *api_submit_exam(int exam_id, int user_id, ApiError *error, int *submitted)
 {
+    if (submitted) *submitted = 0;
     if (exam_id <= 0 || user_id <= 0 || !error) {
         if (error) *error = API_ERR_INVALID_FIELDS;
         return NULL;
@@ -581,11 +997,13 @@ static cJSON *api_submit_exam(int exam_id, int user_id, ApiError *error)
     sqlite3_bind_int(stmt, 2, score);
     sqlite3_bind_int(stmt, 3, attempt_id);
     rc = sqlite3_step(stmt);
+    int changed = sqlite3_changes(auth.db);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
         *error = API_ERR_SUBMIT_FAILED;
         return NULL;
     }
+    if (submitted) *submitted = changed > 0;
 
     cJSON *response = cJSON_CreateObject();
     if (!response) {
@@ -623,7 +1041,21 @@ static void handle_request(int fd)
 
     if (strcmp(method, "GET") == 0 &&
         (strcmp(path, "/health") == 0 || strcmp(path, "/api/v1/health") == 0)) {
-        respond(fd, 200, "OK", "{\"status\":\"ok\",\"service\":\"exam-backend\"}\n", NULL);
+        cJSON *health = cJSON_CreateObject();
+        if (health) {
+            cJSON_AddStringToObject(health, "status", "ok");
+            cJSON_AddStringToObject(health, "service", "exam-backend");
+            cJSON_AddStringToObject(health, "server", sdn_server_id);
+            cJSON_AddNumberToObject(health, "active_attempts",
+                                    atomic_load_explicit(&active_attempts, memory_order_relaxed));
+            cJSON_AddNumberToObject(health, "active_connections",
+                                    atomic_load_explicit(&active_connections, memory_order_relaxed));
+            respond_json(fd, 200, "OK", health, NULL);
+            cJSON_Delete(health);
+        } else {
+            respond(fd, 500, "Internal Server Error",
+                    "{\"error\":\"out_of_memory\"}\n", NULL);
+        }
         return;
     }
 
@@ -678,13 +1110,14 @@ static void handle_request(int fd)
             return;
         }
         cJSON *j = cJSON_CreateObject();
+        if (!j) {
+            respond(fd, 500, "Internal Server Error", "{\"error\":\"out_of_memory\"}\n", NULL);
+            return;
+        }
         cJSON_AddNumberToObject(j, "id", user.user_id);
         cJSON_AddStringToObject(j, "username", user.username);
         cJSON_AddStringToObject(j, "role", user.role);
-        char *printed = cJSON_PrintUnformatted(j);
-        char body[512]; snprintf(body, sizeof(body), "%s\n", printed ? printed : "{}");
-        respond(fd, 200, "OK", body, NULL);
-        if (printed) cJSON_free(printed);
+        respond_json(fd, 200, "OK", j, NULL);
         cJSON_Delete(j);
         return;
     }
@@ -790,7 +1223,7 @@ static void handle_request(int fd)
         sqlite3_stmt *st=NULL; cJSON *root=cJSON_CreateObject(), *arr=cJSON_CreateArray();
         if (!root || !arr || sqlite3_prepare_v2(auth.db,"SELECT id,title,start_time,duration_minutes,status,created_by FROM exams ORDER BY id DESC LIMIT 100",-1,&st,NULL)!=SQLITE_OK) { if(root)cJSON_Delete(root); if(arr)cJSON_Delete(arr); respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL); return; }
         while(sqlite3_step(st)==SQLITE_ROW){ cJSON *e=cJSON_CreateObject(); cJSON_AddNumberToObject(e,"id",sqlite3_column_int(st,0)); cJSON_AddStringToObject(e,"title",(const char*)sqlite3_column_text(st,1)); cJSON_AddNumberToObject(e,"start_time",(double)sqlite3_column_int64(st,2)); cJSON_AddNumberToObject(e,"duration_minutes",sqlite3_column_int(st,3)); cJSON_AddStringToObject(e,"status",(const char*)sqlite3_column_text(st,4)); cJSON_AddNumberToObject(e,"created_by",sqlite3_column_int(st,5)); cJSON_AddItemToArray(arr,e); }
-        sqlite3_finalize(st); cJSON_AddItemToObject(root,"exams",arr); char *p=cJSON_PrintUnformatted(root); if(p && strlen(p)<RESPONSE_SIZE-512){ char b[RESPONSE_SIZE];snprintf(b,sizeof(b),"%s",p);respond(fd,200,"OK",b,NULL);}else respond(fd,500,"Internal Server Error","{\"error\":\"response_too_large\"}\n",NULL); if(p)cJSON_free(p);cJSON_Delete(root);return;
+        sqlite3_finalize(st); cJSON_AddItemToObject(root,"exams",arr); respond_json(fd,200,"OK",root,NULL); cJSON_Delete(root);return;
     }
 
     /* Students can see published exams, but never drafts. */
@@ -801,7 +1234,7 @@ static void handle_request(int fd)
         sqlite3_stmt *st=NULL; cJSON *root=cJSON_CreateObject(), *arr=cJSON_CreateArray();
         const char *sql="SELECT id,title,start_time,duration_minutes,status FROM exams WHERE status IN ('scheduled','active','completed') ORDER BY start_time LIMIT 100";
         if(!root||!arr||sqlite3_prepare_v2(auth.db,sql,-1,&st,NULL)!=SQLITE_OK){if(root)cJSON_Delete(root);if(arr)cJSON_Delete(arr);respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);return;}
-        while(sqlite3_step(st)==SQLITE_ROW){cJSON *e=cJSON_CreateObject();cJSON_AddNumberToObject(e,"id",sqlite3_column_int(st,0));cJSON_AddStringToObject(e,"title",(const char*)sqlite3_column_text(st,1));cJSON_AddNumberToObject(e,"start_time",(double)sqlite3_column_int64(st,2));cJSON_AddNumberToObject(e,"duration_minutes",sqlite3_column_int(st,3));cJSON_AddStringToObject(e,"status",(const char*)sqlite3_column_text(st,4));cJSON_AddItemToArray(arr,e);}sqlite3_finalize(st);cJSON_AddItemToObject(root,"exams",arr);char *p=cJSON_PrintUnformatted(root);if(p&&strlen(p)<RESPONSE_SIZE-512){char b[RESPONSE_SIZE];snprintf(b,sizeof(b),"%s",p);respond(fd,200,"OK",b,NULL);}else respond(fd,500,"Internal Server Error","{\"error\":\"response_too_large\"}\n",NULL);if(p)cJSON_free(p);cJSON_Delete(root);return;
+        while(sqlite3_step(st)==SQLITE_ROW){cJSON *e=cJSON_CreateObject();cJSON_AddNumberToObject(e,"id",sqlite3_column_int(st,0));cJSON_AddStringToObject(e,"title",(const char*)sqlite3_column_text(st,1));cJSON_AddNumberToObject(e,"start_time",(double)sqlite3_column_int64(st,2));cJSON_AddNumberToObject(e,"duration_minutes",sqlite3_column_int(st,3));cJSON_AddStringToObject(e,"status",(const char*)sqlite3_column_text(st,4));cJSON_AddItemToArray(arr,e);}sqlite3_finalize(st);cJSON_AddItemToObject(root,"exams",arr);respond_json(fd,200,"OK",root,NULL);cJSON_Delete(root);return;
     }
 
     /* Admin: publish a draft exam: POST /api/v1/admin/exams/{id}/publish */
@@ -813,7 +1246,7 @@ static void handle_request(int fd)
             if(strcmp(user.role,"admin")!=0){respond(fd,403,"Forbidden","{\"error\":\"admin_role_required\"}\n",NULL);return;}
             sqlite3_stmt *st=NULL; if(sqlite3_prepare_v2(auth.db,"UPDATE exams SET status=CASE WHEN start_time<=? THEN 'active' ELSE 'scheduled' END WHERE id=? AND status='draft'",-1,&st,NULL)!=SQLITE_OK){respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);return;}
             sqlite3_bind_int64(st,1,(sqlite3_int64)time(NULL));sqlite3_bind_int(st,2,eid);int rc=sqlite3_step(st);int changed=sqlite3_changes(auth.db);sqlite3_finalize(st);
-            if(rc!=SQLITE_DONE){respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);}else if(!changed){respond(fd,404,"Not Found","{\"error\":\"draft_exam_not_found\"}\n",NULL);}else respond(fd,200,"OK","{\"status\":\"published\"}\n",NULL);return;
+            if(rc!=SQLITE_DONE){respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);}else if(!changed){respond(fd,404,"Not Found","{\"error\":\"draft_exam_not_found\"}\n",NULL);}else { sdn_emit_event("exam_published", eid); respond(fd,200,"OK","{\"status\":\"published\"}\n",NULL);}return;
         }
     }
 
@@ -833,8 +1266,13 @@ static void handle_request(int fd)
         if(strcmp(method,"POST")==0&&sscanf(path,"/api/v1/student/exams/%d/%23s",&eid,action)==2&&strcmp(action,"start")==0&&eid>0){
             char token[65];AuthUser user;if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}if(strcmp(user.role,"student")!=0){respond(fd,403,"Forbidden","{\"error\":\"student_role_required\"}\n",NULL);return;}
             ApiError error;
-            cJSON *response = api_start_exam(eid, user.user_id, &error);
+            int created = 0;
+            cJSON *response = api_start_exam(eid, user.user_id, &error, &created);
             if (!response) { respond_api_error(fd, error); return; }
+            if (created) {
+                sdn_active_attempts_add(1);
+                sdn_emit_event("attempt_started", eid);
+            }
             respond_json(fd, 200, "OK", response, NULL);
             cJSON_Delete(response);
             return;
@@ -876,8 +1314,13 @@ static void handle_request(int fd)
         int eid=0;char action[24]={0};if(strcmp(method,"POST")==0&&sscanf(path,"/api/v1/student/exams/%d/%23s",&eid,action)==2&&strcmp(action,"submit")==0&&eid>0){
             char token[65];AuthUser user;if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}if(strcmp(user.role,"student")!=0){respond(fd,403,"Forbidden","{\"error\":\"student_role_required\"}\n",NULL);return;}
             ApiError error;
-            cJSON *response = api_submit_exam(eid, user.user_id, &error);
+            int submitted = 0;
+            cJSON *response = api_submit_exam(eid, user.user_id, &error, &submitted);
             if (!response) { respond_api_error(fd, error); return; }
+            if (submitted) {
+                sdn_active_attempts_add(-1);
+                sdn_emit_event("attempt_submitted", eid);
+            }
             respond_json(fd, 200, "OK", response, NULL);
             cJSON_Delete(response);
             return;
@@ -885,7 +1328,7 @@ static void handle_request(int fd)
     }
 
     /* Admin: compact results report. */
-    if(strcmp(path,"/api/v1/admin/results")==0&&strcmp(method,"GET")==0){char token[65];AuthUser user;if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}if(strcmp(user.role,"admin")!=0){respond(fd,403,"Forbidden","{\"error\":\"admin_role_required\"}\n",NULL);return;}sqlite3_stmt *st=NULL;if(sqlite3_prepare_v2(auth.db,"SELECT e.title,u.username,a.status,COALESCE(a.score,0),a.started_at,a.submitted_at FROM exam_attempts a JOIN exams e ON e.id=a.exam_id JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 100",-1,&st,NULL)!=SQLITE_OK){respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);return;}cJSON *root=cJSON_CreateObject(),*arr=cJSON_CreateArray();while(sqlite3_step(st)==SQLITE_ROW){cJSON *r=cJSON_CreateObject();cJSON_AddStringToObject(r,"exam",(const char*)sqlite3_column_text(st,0));cJSON_AddStringToObject(r,"student",(const char*)sqlite3_column_text(st,1));cJSON_AddStringToObject(r,"status",(const char*)sqlite3_column_text(st,2));cJSON_AddNumberToObject(r,"score",sqlite3_column_int(st,3));cJSON_AddNumberToObject(r,"started_at",(double)sqlite3_column_int64(st,4));if(sqlite3_column_type(st,5)!=SQLITE_NULL)cJSON_AddNumberToObject(r,"submitted_at",(double)sqlite3_column_int64(st,5));cJSON_AddItemToArray(arr,r);}sqlite3_finalize(st);cJSON_AddItemToObject(root,"results",arr);char *p=cJSON_PrintUnformatted(root);if(p&&strlen(p)<RESPONSE_SIZE-512){char b[RESPONSE_SIZE];snprintf(b,sizeof(b),"%s",p);respond(fd,200,"OK",b,NULL);}else respond(fd,500,"Internal Server Error","{\"error\":\"response_too_large\"}\n",NULL);if(p)cJSON_free(p);cJSON_Delete(root);return;}
+    if(strcmp(path,"/api/v1/admin/results")==0&&strcmp(method,"GET")==0){char token[65];AuthUser user;if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}if(strcmp(user.role,"admin")!=0){respond(fd,403,"Forbidden","{\"error\":\"admin_role_required\"}\n",NULL);return;}sqlite3_stmt *st=NULL;if(sqlite3_prepare_v2(auth.db,"SELECT e.title,u.username,a.status,COALESCE(a.score,0),a.started_at,a.submitted_at FROM exam_attempts a JOIN exams e ON e.id=a.exam_id JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 100",-1,&st,NULL)!=SQLITE_OK){respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);return;}cJSON *root=cJSON_CreateObject(),*arr=cJSON_CreateArray();while(sqlite3_step(st)==SQLITE_ROW){cJSON *r=cJSON_CreateObject();cJSON_AddStringToObject(r,"exam",(const char*)sqlite3_column_text(st,0));cJSON_AddStringToObject(r,"student",(const char*)sqlite3_column_text(st,1));cJSON_AddStringToObject(r,"status",(const char*)sqlite3_column_text(st,2));cJSON_AddNumberToObject(r,"score",sqlite3_column_int(st,3));cJSON_AddNumberToObject(r,"started_at",(double)sqlite3_column_int64(st,4));if(sqlite3_column_type(st,5)!=SQLITE_NULL)cJSON_AddNumberToObject(r,"submitted_at",(double)sqlite3_column_int64(st,5));cJSON_AddItemToArray(arr,r);}sqlite3_finalize(st);cJSON_AddItemToObject(root,"results",arr);respond_json(fd,200,"OK",root,NULL);cJSON_Delete(root);return;}
 
     if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0 &&
         strcmp(method, "PUT") != 0 && strcmp(method, "DELETE") != 0) {
@@ -929,6 +1372,7 @@ static void *worker_main(void *argument)
         auth_close(&auth);
     }
     close(client_fd);
+    sdn_connection_finished();
     worker_finished();
     return NULL;
 }
@@ -1004,10 +1448,14 @@ static void print_usage(const char *program, FILE *stream)
 {
     fprintf(stream,
             "Usage: %s [--port PORT] [--db PATH] [--addr ADDRESS]\n"
-            "  --port PORT       TCP port to listen on (default: %d)\n"
-            "  --db PATH         SQLite database path (default: %s)\n"
-            "  --addr ADDRESS    IPv4 address to bind (default: %s)\n"
-            "  -h, --help        Show this help\n",
+            "          [--server-id ID] [--controller-url URL]\n"
+            "  --port PORT           TCP port to listen on (default: %d)\n"
+            "  --db PATH             SQLite database path (default: %s)\n"
+            "  --addr ADDRESS        IPv4 address to bind (default: %s)\n"
+            "  --server-id ID        Identity sent to the SDN controller (default: ADDR:PORT)\n"
+            "  --controller-url URL  Ryu REST base URL, e.g. http://10.0.0.254:9090\n"
+            "                        (or set EXAM_CONTROLLER_URL; empty disables)\n"
+            "  -h, --help            Show this help\n",
             program, DEFAULT_PORT, DEFAULT_DB, DEFAULT_ADDR);
 }
 
@@ -1016,17 +1464,25 @@ static int parse_options(int argc, char **argv, ServerConfig *config)
     config->port = DEFAULT_PORT;
     config->db_path = DEFAULT_DB;
     config->addr = DEFAULT_ADDR;
+    config->controller_url = NULL;
+    config->server_id = NULL;
+
+    const char *environment_controller = getenv("EXAM_CONTROLLER_URL");
+    if (environment_controller && environment_controller[0] != '\0')
+        config->controller_url = environment_controller;
 
     static const struct option options[] = {
-        { "port", required_argument, NULL, 'p' },
-        { "db",   required_argument, NULL, 'd' },
-        { "addr", required_argument, NULL, 'a' },
-        { "help", no_argument,       NULL, 'h' },
-        { NULL,   0,                 NULL, 0 }
+        { "port",           required_argument, NULL, 'p' },
+        { "db",             required_argument, NULL, 'd' },
+        { "addr",           required_argument, NULL, 'a' },
+        { "server-id",      required_argument, NULL, 'i' },
+        { "controller-url", required_argument, NULL, 'c' },
+        { "help",           no_argument,       NULL, 'h' },
+        { NULL,             0,                 NULL, 0 }
     };
 
     int option;
-    while ((option = getopt_long(argc, argv, "p:d:a:h", options, NULL)) != -1) {
+    while ((option = getopt_long(argc, argv, "p:d:a:i:c:h", options, NULL)) != -1) {
         switch (option) {
         case 'p':
             if (parse_port(optarg, &config->port) != 0) {
@@ -1047,6 +1503,17 @@ static int parse_options(int argc, char **argv, ServerConfig *config)
                 return -1;
             }
             config->addr = optarg;
+            break;
+        case 'i':
+            if (!optarg || optarg[0] == '\0') {
+                fprintf(stderr, "Server id cannot be empty.\n");
+                return -1;
+            }
+            config->server_id = optarg;
+            break;
+        case 'c':
+            /* An empty value explicitly disables controller notifications. */
+            config->controller_url = (optarg && optarg[0] != '\0') ? optarg : NULL;
             break;
         case 'h':
             print_usage(argv[0], stdout);
@@ -1071,6 +1538,15 @@ int main(int argc, char **argv)
     if (parse_options(argc, argv, &config) != 0) return EXIT_FAILURE;
     database_path = config.db_path;
 
+    if (config.server_id) {
+        snprintf(sdn_server_id, sizeof(sdn_server_id), "%s", config.server_id);
+    } else if (strcmp(config.addr, "0.0.0.0") == 0) {
+        snprintf(sdn_server_id, sizeof(sdn_server_id), "127.0.0.1:%d", config.port);
+    } else {
+        snprintf(sdn_server_id, sizeof(sdn_server_id), "%s:%d",
+                 config.addr, config.port);
+    }
+
     if (install_signal_handlers() != 0) {
         perror("sigaction");
         return EXIT_FAILURE;
@@ -1083,6 +1559,7 @@ int main(int argc, char **argv)
                 database_path);
         return EXIT_FAILURE;
     }
+    sdn_load_active_attempts(&bootstrap_auth);
     auth_close(&bootstrap_auth);
 
     struct sockaddr_in address = {0};
@@ -1114,6 +1591,8 @@ int main(int argc, char **argv)
            config.addr, config.port, database_path);
     fflush(stdout);
 
+    sdn_notifier_start(config.controller_url);
+
     while (!shutdown_requested) {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd == -1) {
@@ -1125,9 +1604,11 @@ int main(int argc, char **argv)
             close(client_fd);
             break;
         }
+        sdn_connection_started();
         configure_client_socket(client_fd);
         if (spawn_worker(client_fd) != 0) {
             perror("pthread_create");
+            sdn_connection_finished();
             close(client_fd);
         }
     }
@@ -1136,6 +1617,7 @@ int main(int argc, char **argv)
     printf("Shutting down; waiting for active connections...\n");
     fflush(stdout);
     wait_for_workers();
+    sdn_notifier_stop();
     pthread_cond_destroy(&workers_cond);
     pthread_mutex_destroy(&workers_mutex);
     pthread_cond_destroy(&login_sem.cond);
