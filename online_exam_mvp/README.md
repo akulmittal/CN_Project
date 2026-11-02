@@ -146,14 +146,17 @@ The test builds the server, starts a stub controller, seeds 20 students and a 50
 
 ## Mininet/SDN notes
 
-The controller REST contract and VIP-to-backend mapping are implemented by the Ryu app in `controller/` and the topology in `mininet/` (added in the SDN milestones). This server-side task only requires:
+The controller REST contract and VIP-to-backend mapping are implemented by the
+top-level `sdn/` project: `sdn/controller/exam_controller.py`,
+`sdn/topology.py`, and `sdn/scripts/`. This server-side task only requires:
 
 - bind `0.0.0.0` on each server so VIP traffic is accepted;
 - pass the correct `--server-id` and `--db` (a shared WAL database for srv1/srv2);
 - pass `--controller-url http://10.0.0.254:9090`;
 - do not use Nginx inside Mininet.
 
-See `docs/server-design.md` for the notifier/threading design and viva notes.
+See `docs/server-design.md` for the notifier/threading design and
+`../docs/sdn-design.md` for the Mininet controller, topology, and demo.
 
 ## Full demo flow
 
