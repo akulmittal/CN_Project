@@ -5,5 +5,15 @@ create_user
 *.db-shm
 *.db-wal
 cookies.txt
+*cookies*.txt
+student-cookies.txt
+users.csv
+*.users.csv
+results/
+run/
+*.pid
 logs/*
 !logs/.gitkeep
+*.dSYM
+__pycache__/
+*.pyc

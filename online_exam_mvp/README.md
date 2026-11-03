@@ -1,30 +1,52 @@
 # Online Examination System — MVP
 
-A local learning/demo implementation for the Computer Networks project. It demonstrates a C TCP/HTTP backend, Nginx reverse proxy, SQLite persistence, password hashing with libsodium/Argon2id, opaque server-side sessions, role-based routes, exam scheduling, question creation, student attempts, answer autosave, and basic auto-grading.
+A local learning/demo implementation for the Computer Networks project. It demonstrates a C TCP/HTTP backend using raw sockets, SQLite persistence, password hashing with libsodium/Argon2id, opaque server-side sessions, role-based routes, exam scheduling, question creation, student attempts, answer autosave, and basic auto-grading. The server is also Mininet-ready: it can emit exam/health events to the Ryu controller over a hand-written HTTP/1.1 notifier without blocking client requests.
 
-> **Important security boundary:** this is a coursework MVP, not a production examination service. The demo currently stores grading keys in the same SQLite database as the web API. For a real deployment, move grading keys and grading into a separate service/database inaccessible to the student-facing backend. Do not expose this service to the public internet without HTTPS, request timeouts, rate limiting, CSRF protections, robust HTTP parsing, audit logging, backups, and security review. The current server handles connections sequentially; concurrency and SDN/Mininet/Ryu integration are future implementation milestones, not implemented features.
+> **Important security boundary:** this is a coursework MVP, not a production examination service. The demo currently stores grading keys in the same SQLite database as the web API. For a real deployment, move grading keys and grading into a separate service/database inaccessible to the student-facing backend. Do not expose this service to the public internet without HTTPS, request timeouts, rate limiting, CSRF protections, robust HTTP parsing, audit logging, backups, and security review. The backend uses one detached worker thread per connection, each with its own SQLite connection, and shuts down cleanly on SIGINT/SIGTERM.
 
 ## Requirements (Ubuntu/WSL)
 
 ```bash
 sudo apt update
-sudo apt install build-essential pkg-config libsqlite3-dev libsodium-dev libcjson-dev sqlite3 nginx curl
+sudo apt install build-essential pkg-config libsqlite3-dev libsodium-dev libcjson-dev sqlite3 curl
 ```
+
+For the optional browser UI through Nginx, install `nginx` as well. Nginx is **not** used in the Mininet/SDN topology; clients talk directly to the C server or the SDN VIP.
+
+Python tooling uses only the standard library (`socket`, `csv`, `json`, `threading`, `subprocess`); no `requests`/`urllib` is used for exam traffic.
 
 ## Build and initialize
 
-Run from this project root, because the database path is relative:
+Run from this project root, because the default database path is relative:
 
 ```bash
 make
 sqlite3 database/exam.db < database/schema.sql
-./create_user examadmin admin
-./create_user student01 student
+read -rsp 'Admin password: ' PW; echo
+printf '%s\n' "$PW" | ./create_user --password-stdin examadmin admin
+unset PW
+read -rsp 'Student password: ' PW; echo
+printf '%s\n' "$PW" | ./create_user --password-stdin student01 student
+unset PW
 ```
 
-Passwords are prompted without echo and are not saved in source code. Use passwords at least 12 characters long.
+`create_user` reads the password from stdin with `--password-stdin`, so it never appears in shell history or the process list. Interactive use still prompts twice without echo:
+
+```bash
+./create_user examadmin admin
+```
+
+Passwords must be at least 12 characters. For a repeatable demo with generated credentials, run the server and then:
+
+```bash
+python3 tools/seed_demo.py --students 20 --users-file users.csv
+```
+
+It creates one admin, 20 students, a published exam with 10 questions, writes `users.csv` (mode 0600, git-ignored), and prints the exam id as JSON. Use `--question-count 50` to exercise a large paper response, and `--reset-users` to recreate the demo accounts in an existing database.
 
 If migrating from the earlier project, back up `database/exam.db` before changing schema. This MVP uses `exam_questions`, `exam_attempts`, `student_answers`, and `grading_keys` as separate tables; it does not delete existing data.
+
+Never commit `users.csv`, cookie jars, or `*.db` files; all are ignored by `.gitignore`.
 
 ## Nginx
 
@@ -42,18 +64,99 @@ sudo cp web/index.html /var/www/html/index.html
 
 ## Start backend
 
-Terminal 1:
-
 ```bash
-cd ~/CN_Project   # or the directory where you extracted this project
-./exam_server
+./exam_server [--port PORT] [--db PATH] [--addr ADDRESS]
+              [--server-id ID] [--controller-url URL]
 ```
 
-Terminal 2 uses Nginx:
+Defaults are port `8080`, database `database/exam.db`, and bind address `0.0.0.0` (all IPv4 interfaces). Run from the project root unless you pass an absolute `--db` path. For example, two independent instances can run without rebuilding:
 
 ```bash
-curl -i http://localhost/backend/health
+./exam_server --port 8080 --db database/exam.db
+./exam_server --port 8081 --db database/exam-2.db
 ```
+
+The server handles each connection in its own detached worker thread and waits for active workers on Ctrl-C/SIGTERM before exiting, so it can be restarted immediately.
+
+### Health counters
+
+`GET /health` and `GET /api/v1/health` return the same JSON. `active_attempts` is an atomic counter initialized from in-progress attempts in the shared database; `active_connections` is the number of accepted connections currently being served (the health request itself is included while it is being handled).
+
+```json
+{"status":"ok","service":"exam-backend","server":"10.0.0.1:8080","active_attempts":3,"active_connections":5}
+```
+
+### Controller notifier
+
+Set `--controller-url` or the `EXAM_CONTROLLER_URL` environment variable (CLI wins):
+
+```bash
+./exam_server --addr 0.0.0.0 --port 8080 \
+  --db /absolute/path/database/exam.db \
+  --server-id 10.0.0.1:8080 \
+  --controller-url http://10.0.0.254:9090
+```
+
+The notifier appends events to a bounded in-memory queue and sends them from one dedicated thread using hand-written HTTP/1.1 with 300 ms connect/send/recv timeouts. A slow or unreachable controller never delays or fails an API request. Events are `exam_published`, `attempt_started`, `attempt_submitted`, and a `server_status` heartbeat every 2 seconds:
+
+```json
+{"event":"attempt_started","server":"10.0.0.1:8080","exam_id":1,"active_attempts":1,"active_connections":4,"ts":1793638352}
+```
+
+Bind servers to `0.0.0.0` in Mininet so they also accept traffic addressed to the VIP whose IP is configured on loopback. Use `--server-id 10.0.0.1:8080` (or `10.0.0.2:8080`) so events identify the correct backend.
+
+### HTTP connection behaviour
+
+The MVP deliberately supports one request per TCP connection. Every response includes `Connection: close`, a correct `Content-Length`, and the worker closes the socket after replying. HTTP keep-alive/pipelining is therefore not supported; clients should open a new connection for each request. `client/exam_client.py` and `client/loadgen.py` follow this contract. Responses are built dynamically, so a 50-question paper is not truncated by the old 4 KiB response buffer.
+
+With the server running, test through Nginx (optional) or directly:
+
+```bash
+curl -i http://localhost:8080/health
+curl -i http://localhost/backend/health   # if Nginx is configured
+```
+
+## Load generation
+
+`client/exam_client.py` is a stdlib-`socket` HTTP client used by the demo tools. `client/loadgen.py` follows the project contract:
+
+```bash
+python3 client/loadgen.py \
+  --target 127.0.0.1:8080 --clients 20 --exam-id 1 \
+  --users-file users.csv --answers-per-client 3 --think-ms 5 \
+  --out results/baseline.csv
+```
+
+CSV columns are `ts_start,client,op,latency_ms,status,ok`, where `ok` is `1`/`0`. The final stdout line is a summary JSON such as:
+
+```json
+{"clients":20,"requests":140,"errors":0,"p50_ms":0.851,"p95_ms":280.794,"p99_ms":351.859,"throughput_rps":385.948,"duration_s":0.363}
+```
+
+Each client logs in, starts the exam, fetches the paper, saves `K` answers with the requested think time, and submits. Percentiles and throughput count successful requests only; login latency includes Argon2id verification, so it dominates the tail for large bursts. Diagnostics go to stderr so the summary line stays machine-readable.
+
+## Integration test
+
+```bash
+make test          # builds, then runs tests/integration.sh
+bash tests/integration.sh
+```
+
+The test builds the server, starts a stub controller, seeds 20 students and a 50-question exam on a temporary database, runs 20 concurrent loadgen clients, asserts zero errors and that all four event types arrive, sends SIGINT and restarts immediately on the same port, verifies two servers sharing one WAL database, and checks that `/health` stays fast when the controller URL is unreachable.
+
+## Mininet/SDN notes
+
+The controller REST contract and VIP-to-backend mapping are implemented by the
+top-level `sdn/` project: `sdn/controller/exam_controller.py`,
+`sdn/topology.py`, and `sdn/scripts/`. This server-side task only requires:
+
+- bind `0.0.0.0` on each server so VIP traffic is accepted;
+- pass the correct `--server-id` and `--db` (a shared WAL database for srv1/srv2);
+- pass `--controller-url http://10.0.0.254:9090`;
+- do not use Nginx inside Mininet.
+
+See `docs/server-design.md` for the notifier/threading design and
+`../docs/sdn-design.md` for the Mininet controller, topology, and demo.
 
 ## Full demo flow
 
@@ -151,18 +254,24 @@ curl -i -b cookies.txt http://localhost/backend/api/v1/admin/results
 ## Next engineering milestones
 
 1. Move grading keys into a separate grading service/database and use authenticated service-to-service requests.
-2. Harden HTTP parser: socket timeouts, strict headers, content-type validation, body limits, correct status/error handling.
-3. Use a per-worker SQLite connection (or a database pool) and add thread/epoll-based concurrent clients. Add stress tests and measure p50/p95 latency.
+2. Harden HTTP parser further: strict headers, content-type validation, body limits, request rate limiting, correct status/error handling.
+3. Add a database pool or connection reuse for high connection churn; benchmark many clients.
 4. Add CSRF tokens for cookie-authenticated state-changing routes; deploy only behind HTTPS and mark cookies `Secure`.
 5. Implement WebSocket exam updates/autosave acknowledgement and a browser question-taking UI.
 6. Add server-side clock synchronization (chrony/NTP), audit logs, backup/restore tests, and failure recovery.
-7. Add Mininet + Open vSwitch + Ryu controller for SDN traffic monitoring/policy enforcement; benchmark with many clients.
+7. Complete Mininet + Open vSwitch + Ryu controller for SDN VIP failover, exam-aware policy, and attack mitigation.
 
 ## Project layout
 
-- `src/server.c`: C HTTP/TCP backend and routes
+- `src/server.c`: C HTTP/TCP backend, routes, dynamic responses, SDN notifier
 - `src/auth.c`, `include/auth.h`: password hashing, sessions, auth helpers
-- `src/create_user.c`: safe local account provisioning utility
+- `src/create_user.c`: safe local account provisioning (`--password-stdin`)
+- `tools/seed_demo.py`: generated demo users + published exam, writes git-ignored `users.csv`
+- `client/exam_client.py`: stdlib-`socket` exam HTTP client
+- `client/loadgen.py`: concurrent load generator and CSV/summary output
+- `tests/integration.sh`: repeatable end-to-end server checks
+- `tests/stub_controller.py`: local `/exam/event` receiver used by tests
 - `database/schema.sql`: schema for fresh databases
 - `web/index.html`: basic admin/student demo UI
-- `config/nginx-exam.conf`: Nginx proxy example
+- `config/nginx-exam.conf`: optional Nginx proxy example (not used in Mininet)
+- `docs/server-design.md`: threading, notifier, response and testing design notes

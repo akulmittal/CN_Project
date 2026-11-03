@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic -O2 -g -Iinclude $(shell pkg-config --cflags sqlite3 libsodium libcjson)
 LDLIBS = $(shell pkg-config --libs sqlite3 libsodium libcjson) -pthread
 
-.PHONY: all clean schema
+.PHONY: all clean schema test
 all: exam_server create_user
 
 exam_server: src/server.c src/auth.c include/auth.h
@@ -16,3 +16,6 @@ schema:
 
 clean:
 	rm -f exam_server create_user src/*.o
+
+test: all
+	bash tests/integration.sh

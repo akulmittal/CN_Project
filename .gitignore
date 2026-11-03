@@ -1,0 +1,12 @@
+# Python / SDN runtime artifacts
+__pycache__/
+*.pyc
+sdn/.venv/
+run/
+*.ndjson
+
+# Demo credentials and temporary test output
+users.csv
+*.users.csv
+*.log
+*.pid
