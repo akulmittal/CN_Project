@@ -612,8 +612,6 @@ class Demo:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=3.0)
-        srv1 = self.host("srv1")
-        srv1.cmd(f"pkill -f {STUB.name} >/dev/null 2>&1 || true")
         state = wait_until(
             lambda: (
                 current

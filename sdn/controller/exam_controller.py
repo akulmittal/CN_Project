@@ -54,8 +54,16 @@ from os_ken.controller.handler import (
     MAIN_DISPATCHER,
     set_ev_cls,
 )
-from os_ken.lib import hub, packet
-from os_ken.lib.packet import arp, ethernet, icmp, ipv4, tcp, udp
+from os_ken.lib import hub
+from os_ken.lib.packet import (
+    arp,
+    ethernet,
+    icmp,
+    ipv4,
+    packet,
+    tcp,
+    udp,
+)
 from os_ken.ofproto import ofproto_v1_3, ofproto_v1_3_parser as parser
 
 # ---------------------------------------------------------------------------

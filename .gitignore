@@ -5,6 +5,8 @@ sdn/.venv/
 run/
 *.ndjson
 
-# Temporary test output
+# Demo credentials and temporary test output
+users.csv
+*.users.csv
 *.log
 *.pid

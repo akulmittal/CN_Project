@@ -364,7 +364,7 @@ else
     METER_ADDED=0
     METER_ERR=""
     if METER_ERR=$(ovs_ofctl_q -O OpenFlow13 add-meter "$BRIDGE" \
-      'meter=1,kbps,burst,band=type=drop,rate=1000,burst=1000' 2>&1); then
+      'meter=1,kbps,burst,band=type=drop,rate=1000,burst_size=1000' 2>&1); then
       METER_ADDED=1
       pass "OpenFlow13 meter add succeeded"
     else
