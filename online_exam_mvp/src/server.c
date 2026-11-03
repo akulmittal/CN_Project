@@ -1250,6 +1250,43 @@ static void handle_request(int fd)
         }
     }
 
+    /* Admin: update exam schedule (start_time, duration_minutes) for draft exams */
+    {
+        int eid=0; char tail[32]={0};
+        if (strcmp(method,"PUT")==0 && sscanf(path,"/api/v1/admin/exams/%d/%31s",&eid,tail)==2 && strcmp(tail,"schedule")==0 && eid>0) {
+            char token[65]; AuthUser user;
+            if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}
+            if(strcmp(user.role,"admin")!=0){respond(fd,403,"Forbidden","{\"error\":\"admin_role_required\"}\n",NULL);return;}
+            if (body_length == 0) {
+                respond(fd, 400, "Bad Request", "{\"error\":\"json_body_required\"}\n", NULL);
+                return;
+            }
+            char *body = request + header_length;
+            body[body_length] = '\0';
+            cJSON *json = cJSON_Parse(body);
+            cJSON *start_json = json ? cJSON_GetObjectItemCaseSensitive(json, "start_time") : NULL;
+            cJSON *duration_json = json ? cJSON_GetObjectItemCaseSensitive(json, "duration_minutes") : NULL;
+            int has_start = cJSON_IsNumber(start_json) && start_json->valuedouble > 0 && start_json->valuedouble <= 9007199254740991.0 && start_json->valuedouble == (double)(long long)start_json->valuedouble;
+            int has_duration = cJSON_IsNumber(duration_json) && duration_json->valuedouble >= 1 && duration_json->valuedouble <= 1440 && duration_json->valuedouble == (double)(int)duration_json->valuedouble;
+            if (!has_start && !has_duration) {
+                if (json) cJSON_Delete(json);
+                respond(fd, 400, "Bad Request", "{\"error\":\"invalid_fields\"}\n", NULL);
+                return;
+            }
+            sqlite3_stmt *st=NULL;
+            const char *sql = "UPDATE exams SET start_time=COALESCE(?,start_time), duration_minutes=COALESCE(?,duration_minutes) WHERE id=? AND status='draft'";
+            if(sqlite3_prepare_v2(auth.db,sql,-1,&st,NULL)!=SQLITE_OK){if(json)cJSON_Delete(json);respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);return;}
+            if (has_start) sqlite3_bind_int64(st,1,(sqlite3_int64)start_json->valuedouble); else sqlite3_bind_null(st,1);
+            if (has_duration) sqlite3_bind_int(st,2,(int)duration_json->valuedouble); else sqlite3_bind_null(st,2);
+            sqlite3_bind_int(st,3,eid);
+            int rc=sqlite3_step(st);
+            int changed=sqlite3_changes(auth.db);
+            sqlite3_finalize(st);
+            if (json) cJSON_Delete(json);
+            if(rc!=SQLITE_DONE){respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);}else if(!changed){respond(fd,404,"Not Found","{\"error\":\"draft_exam_not_found\"}\n",NULL);}else { respond(fd,200,"OK","{\"status\":\"updated\"}\n",NULL);}return;
+        }
+    }
+
     /* Admin: add a question and its grading key. Demo only: grading key is in this DB. */
     if(strcmp(path,"/api/v1/admin/questions")==0 && strcmp(method,"POST")==0){
         char token[65];AuthUser user;if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}if(strcmp(user.role,"admin")!=0){respond(fd,403,"Forbidden","{\"error\":\"admin_role_required\"}\n",NULL);return;}
@@ -1324,6 +1361,61 @@ static void handle_request(int fd)
             respond_json(fd, 200, "OK", response, NULL);
             cJSON_Delete(response);
             return;
+        }
+    }
+
+    /* Student: list own attempts with scores. */
+    if(strcmp(path,"/api/v1/student/results")==0&&strcmp(method,"GET")==0){
+        char token[65];AuthUser user;if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}if(strcmp(user.role,"student")!=0){respond(fd,403,"Forbidden","{\"error\":\"student_role_required\"}\n",NULL);return;}
+        sqlite3_stmt *st=NULL;cJSON *root=cJSON_CreateObject(),*arr=cJSON_CreateArray();
+        const char *sql="SELECT e.title,e.id,a.status,COALESCE(a.score,0),a.started_at,a.submitted_at FROM exam_attempts a JOIN exams e ON e.id=a.exam_id WHERE a.user_id=? ORDER BY a.id DESC LIMIT 100";
+        if(!root||!arr||sqlite3_prepare_v2(auth.db,sql,-1,&st,NULL)!=SQLITE_OK){if(root)cJSON_Delete(root);if(arr)cJSON_Delete(arr);respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);return;}
+        sqlite3_bind_int(st,1,user.user_id);
+        while(sqlite3_step(st)==SQLITE_ROW){cJSON *r=cJSON_CreateObject();cJSON_AddStringToObject(r,"exam",(const char*)sqlite3_column_text(st,0));cJSON_AddNumberToObject(r,"exam_id",sqlite3_column_int(st,1));cJSON_AddStringToObject(r,"status",(const char*)sqlite3_column_text(st,2));cJSON_AddNumberToObject(r,"score",sqlite3_column_int(st,3));cJSON_AddNumberToObject(r,"started_at",(double)sqlite3_column_int64(st,4));if(sqlite3_column_type(st,5)!=SQLITE_NULL)cJSON_AddNumberToObject(r,"submitted_at",(double)sqlite3_column_int64(st,5));cJSON_AddItemToArray(arr,r);}
+        sqlite3_finalize(st);cJSON_AddItemToObject(root,"results",arr);respond_json(fd,200,"OK",root,NULL);cJSON_Delete(root);return;
+    }
+
+    /* Student: get specific exam attempt details. */
+    {
+        int eid=0; char tail[32]={0};
+        if(strcmp(method,"GET")==0 && sscanf(path,"/api/v1/student/exams/%d/%31s",&eid,tail)==2 && strcmp(tail,"result")==0 && eid>0){
+            char token[65];AuthUser user;if(get_session_cookie(request,token,sizeof(token))!=0||auth_validate_session(&auth,token,&user)!=0){respond(fd,401,"Unauthorized","{\"error\":\"authentication_required\"}\n",NULL);return;}if(strcmp(user.role,"student")!=0){respond(fd,403,"Forbidden","{\"error\":\"student_role_required\"}\n",NULL);return;}
+            sqlite3_stmt *st=NULL;
+            const char *sql="SELECT e.title,a.id,a.status,COALESCE(a.score,0),a.started_at,a.submitted_at FROM exam_attempts a JOIN exams e ON e.id=a.exam_id WHERE a.exam_id=? AND a.user_id=?";
+            if(sqlite3_prepare_v2(auth.db,sql,-1,&st,NULL)!=SQLITE_OK){respond(fd,500,"Internal Server Error","{\"error\":\"database_error\"}\n",NULL);return;}
+            sqlite3_bind_int(st,1,eid);sqlite3_bind_int(st,2,user.user_id);
+            int rc=sqlite3_step(st);
+            if(rc==SQLITE_ROW){
+                cJSON *root=cJSON_CreateObject();
+                cJSON_AddStringToObject(root,"exam",(const char*)sqlite3_column_text(st,0));
+                cJSON_AddNumberToObject(root,"attempt_id",sqlite3_column_int(st,1));
+                cJSON_AddStringToObject(root,"status",(const char*)sqlite3_column_text(st,2));
+                cJSON_AddNumberToObject(root,"score",sqlite3_column_int(st,3));
+                cJSON_AddNumberToObject(root,"started_at",(double)sqlite3_column_int64(st,4));
+                if(sqlite3_column_type(st,5)!=SQLITE_NULL)cJSON_AddNumberToObject(root,"submitted_at",(double)sqlite3_column_int64(st,5));
+                sqlite3_finalize(st);
+                /* Include per-question answers */
+                const char *qsql="SELECT q.id,q.question_text,q.question_type,q.marks,sa.answer_text,k.answer_text AS correct_answer FROM exam_questions q LEFT JOIN student_answers sa ON sa.question_id=q.id AND sa.attempt_id=? LEFT JOIN grading_keys k ON k.question_id=q.id WHERE q.exam_id=? ORDER BY q.position";
+                if(sqlite3_prepare_v2(auth.db,qsql,-1,&st,NULL)==SQLITE_OK){
+                    sqlite3_bind_int(st,1,sqlite3_column_int(st,1));sqlite3_bind_int(st,2,eid);
+                    cJSON *qarr=cJSON_CreateArray();
+                    while(sqlite3_step(st)==SQLITE_ROW){
+                        cJSON *qobj=cJSON_CreateObject();
+                        cJSON_AddNumberToObject(qobj,"question_id",sqlite3_column_int(st,0));
+                        cJSON_AddStringToObject(qobj,"question_text",(const char*)sqlite3_column_text(st,1));
+                        cJSON_AddStringToObject(qobj,"question_type",(const char*)sqlite3_column_text(st,2));
+                        cJSON_AddNumberToObject(qobj,"marks",sqlite3_column_int(st,3));
+                        cJSON_AddStringToObject(qobj,"answer",sqlite3_column_text(st,4)?(const char*)sqlite3_column_text(st,4):"");
+                        if(sqlite3_column_text(st,5))cJSON_AddStringToObject(qobj,"correct_answer",(const char*)sqlite3_column_text(st,5));
+                        cJSON_AddItemToArray(qarr,qobj);
+                    }
+                    sqlite3_finalize(st);
+                    cJSON_AddItemToObject(root,"questions",qarr);
+                }
+                respond_json(fd,200,"OK",root,NULL);cJSON_Delete(root);return;
+            }
+            sqlite3_finalize(st);
+            respond(fd,404,"Not Found","{\"error\":\"attempt_not_found\"}\n",NULL);return;
         }
     }
 
