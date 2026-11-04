@@ -321,7 +321,7 @@ sudo python3 sdn/scripts/demo.py --students 10 --no-flood --no-failover
 
 ## Contributors
 
-- **Shankar Nag** — Backend, Frontend, SDN Integration, Demo Automation
+- **Achyuth Jois M** — Backend, Frontend, SDN Integration, Demo Automation
 - **Akul** — SDN Controller, Mininet Topology, QoS Implementation
 - **Akshay Javli** — Documentation, Testing, Demo Scripts
 
