@@ -209,23 +209,23 @@ Open `http://localhost` in browser. Login with credentials from `users.csv`.
 
 ### Terminal 1: Controller
 ```bash
-cd /home/shankar-nag/CN_Project
+cd /home/akul@Lenovoi7/CN_Project
 ./run_demo.sh sdn-venv
 ./run_demo.sh controller
 ```
 
 ### Terminal 2: Mininet
 ```bash
-cd /home/shankar-nag/CN_Project
+cd /home/akul@Lenovoi7/CN_Project
 ./run_demo.sh mininet
 # In Mininet CLI:
-mininet> srv1 /home/shankar-nag/CN_Project/online_exam_mvp/exam_server --addr 0.0.0.0 --port 8080 --db /home/shankar-nag/CN_Project/online_exam_mvp/database/exam.db --server-id 10.0.0.1:8080 --controller-url http://10.0.0.254:9090 &
-mininet> srv2 /home/shankar-nag/CN_Project/online_exam_mvp/exam_server --addr 0.0.0.0 --port 8080 --db /home/shankar-nag/CN_Project/online_exam_mvp/database/exam.db --server-id 10.0.0.2:8080 --controller-url http://10.0.0.254:9090 &
+mininet> srv1 /home/akul@Lenovoi7/CN_Project/online_exam_mvp/exam_server --addr 0.0.0.0 --port 8080 --db /home/akul@Lenovoi7/CN_Project/online_exam_mvp/database/exam.db --server-id 10.0.0.1:8080 --controller-url http://10.0.0.254:9090 &
+mininet> srv2 /home/akul@Lenovoi7/CN_Project/online_exam_mvp/exam_server --addr 0.0.0.0 --port 8080 --db /home/akul@Lenovoi7/CN_Project/online_exam_mvp/database/exam.db --server-id 10.0.0.2:8080 --controller-url http://10.0.0.254:9090 &
 ```
 
 ### Terminal 3: Run Automated Demo
 ```bash
-cd /home/shankar-nag/CN_Project
+cd /home/akul@Lenovoi7/CN_Project
 sudo ./run_demo.sh demo
 # Or for specific tests:
 sudo python3 sdn/scripts/demo.py --students 10 --no-flood --no-failover
